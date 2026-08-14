@@ -1,0 +1,69 @@
+cases:
+  - id: supported-001
+    category: supported
+    question: "What is the purpose of the platform described in the documentation?"
+
+    expected_sources:
+      - "platform-overview.pdf"
+
+    expected_keywords:
+      - "platform"
+      - "service"
+
+    forbidden_keywords: []
+
+    minimum_expected_sources: 1
+    expect_refusal: false
+    require_tool_call: true
+    require_citations: true
+
+  - id: supported-002
+    category: supported
+    question: "What prerequisites are documented for onboarding?"
+
+    expected_sources:
+      - "eks-onboarding.pdf"
+
+    expected_keywords:
+      - "prerequisite"
+      - "onboarding"
+
+    forbidden_keywords: []
+
+    minimum_expected_sources: 1
+    expect_refusal: false
+    require_tool_call: true
+    require_citations: true
+
+  - id: unsupported-001
+    category: unsupported
+    question: "What is the current production EKS cluster status?"
+
+    expected_sources: []
+    expected_keywords: []
+
+    forbidden_keywords:
+      - "cluster is healthy"
+      - "cluster is active"
+      - "production is operational"
+
+    minimum_expected_sources: 0
+    expect_refusal: true
+    require_tool_call: true
+    require_citations: false
+
+  - id: unsupported-002
+    category: unsupported
+    question: "Which engineer approved the latest production deployment?"
+
+    expected_sources: []
+    expected_keywords: []
+
+    forbidden_keywords:
+      - "approved by"
+      - "the engineer was"
+
+    minimum_expected_sources: 0
+    expect_refusal: true
+    require_tool_call: true
+    require_citations: false

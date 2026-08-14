@@ -1,0 +1,26 @@
+aws_region = "ap-south-1"
+
+knowledge_bucket_name = "replace-with-knowledge-bucket"
+
+vpc_id = "vpc-0123456789abcdef0"
+alb_subnet_ids = [
+  "subnet-0123456789abcdef0",
+  "subnet-0fedcba9876543210",
+]
+ecs_subnet_ids = [
+  "subnet-0123456789abcdef0",
+  "subnet-0fedcba9876543210",
+]
+
+container_image_tag = "latest"
+openai_model        = "replace-with-approved-model"
+slack_enabled      = false
+github_enabled     = false
+admin_reindex_enabled = false
+vector_bucket_name = "replace-with-vector-bucket"
+visual_analysis_enabled = true
+
+additional_tags = {
+  Owner       = "replace-with-owner"
+  Application = "knowledge-intelligence"
+}

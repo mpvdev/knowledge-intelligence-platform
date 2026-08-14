@@ -1,1 +1,29 @@
 .DS_Store
+.env
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+tmp/
+*.egg-info/
+__pycache__/
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+**/backend.hcl
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Keep examples and lock files
+!*.tfvars.example
+!*.hcl.example
+!.terraform.lock.hcl

@@ -1,0 +1,1 @@
+"""In-memory document retrieval."""

@@ -1,0 +1,18 @@
+id: observability
+name: Observability
+
+aliases:
+  - Observability
+  - CLM
+  - Logging & Monitoring
+
+description: |
+  TME capability responsible for observability of TME managed infrastructure and applications.
+
+repositories:
+  - name: tme-observability
+
+documentation_prefixes:
+  - raw/confluence/observability
+
+owner: TME Platform Engineering

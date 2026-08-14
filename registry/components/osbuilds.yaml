@@ -1,0 +1,19 @@
+id: osbuilds
+name: OS Builds
+
+description: |
+  TME capability responsible for building and maintaining OS images for TME managed infrastructure and applications.
+
+aliases:
+  - OS Builds
+  - Golden AMI
+  - OS Image Management
+  - Patch
+
+repositories:
+  - name: tme-ami-builder
+
+documentation_prefixes:
+  - raw/confluence/osbuilds
+
+owner: TME Platform Engineering
