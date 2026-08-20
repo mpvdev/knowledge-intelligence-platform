@@ -1,1 +1,0 @@
-"""Platform knowledge agent construction."""

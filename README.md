@@ -39,9 +39,13 @@ app/
     s3_reader.py          read-only Confluence source access
     github_reader.py      README-only GitHub access
     slack.py              Slack delivery
+    diagram.py            Slack flow-diagram rendering
+    metrics.py            per-answer timing via agent lifecycle hooks
+    diagram_analysis.py   decides when content supports a diagram
 registry/components/     one YAML file per component
 scripts/ingest.py        explicit index rebuild
 scripts/validate_search.py
+scripts/evaluate.py      grounding and refusal scorecard
 ```
 
 ## Local setup
@@ -62,6 +66,15 @@ KNOWLEDGE_INTELLIGENCE_GITHUB_ENABLED=true
 KNOWLEDGE_INTELLIGENCE_GITHUB_TOKEN=your-read-only-fine-grained-pat
 KNOWLEDGE_INTELLIGENCE_GITHUB_API_URL=https://api.github.com
 ```
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+The suite runs entirely offline and makes no AWS, OpenAI, or Slack calls.
 
 ## Ingest and validate
 
@@ -117,6 +130,17 @@ Slack adds Phase 1 knowledge-sharing capabilities without changing the public AP
 - two or three grounded suggested follow-up questions
 - clickable follow-up buttons that continue in the same Slack thread
 - Helpful, Partly, and Not helpful feedback buttons
+- answers that stream into the message as they are written
+
+Answers are delivered progressively: the placeholder message fills in while the answer is
+generated, throttled to respect Slack rate limits. Disable with
+`KNOWLEDGE_INTELLIGENCE_SLACK_STREAMING_ENABLED=false`. Slash-command replies remain
+non-streaming because `response_url` posts new messages instead of editing one.
+
+Set `KNOWLEDGE_INTELLIGENCE_SESSION_PERSISTENCE_ENABLED=true` to back each thread with
+Amazon S3 so conversations survive a task restart, and
+`KNOWLEDGE_INTELLIGENCE_CONVERSATION_SUMMARIZATION_ENABLED=true` to summarize older turns
+instead of dropping them.
 
 Each Slack thread receives an independent Strands conversation with a bounded sliding
 window. Recent user questions, answers, and tool results are retained for two hours in
@@ -171,6 +195,21 @@ KNOWLEDGE_INTELLIGENCE_FEEDBACK_PREFIX=feedback/slack
 The selected OpenAI model must support image input. Leaving the visual model empty uses
 `KNOWLEDGE_INTELLIGENCE_OPENAI_MODEL`. Re-run `scripts/ingest.py` after enabling it.
 Visual calls occur only for candidate pages and incur model usage.
+
+## Evaluation
+
+Score the agent against the approved dataset in `evals/datasets/`:
+
+```bash
+python scripts/evaluate.py
+python scripts/evaluate.py --judge
+```
+
+The default run uses deterministic evaluators — refusal discipline, forbidden-claim
+detection, expected-term coverage, and internal-wording leakage — and costs only the agent
+calls. `--judge` adds the Strands LLM-as-judge faithfulness and refusal evaluators, which
+make additional model calls. Both write a Markdown scorecard to
+`evals/reports/platform_knowledge.md`.
 
 ## Container and AWS
 

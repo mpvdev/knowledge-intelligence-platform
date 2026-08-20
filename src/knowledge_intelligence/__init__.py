@@ -1,1 +1,0 @@
-"""Knowledge Intelligence application package."""

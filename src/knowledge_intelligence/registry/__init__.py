@@ -1,1 +1,0 @@
-"""Curated platform component registry."""

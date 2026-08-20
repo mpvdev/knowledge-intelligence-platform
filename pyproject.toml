@@ -1,39 +1,31 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+# Tooling configuration only.
+#
+# Runtime dependencies live in requirements.txt, which is what the Dockerfile and
+# the local setup in README.md install. They are deliberately not duplicated here.
 
 [project]
 name = "knowledge-intelligence"
 version = "0.1.0"
-description = "Knowledge intelligence platform for TME Engineering documentation"
+description = "Source-grounded Platform Knowledge Agent for TME"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = [
-    "boto3>=1.43,<2.0",
-    "pydantic>=2.10,<3.0",
-    "pydantic-settings>=2.7,<3.0",
-    "pypdf>=6.0,<7.0",
-    "python-docx>=1.2,<2.0",
-    "pymupdf>=1.26,<2.0",
-    "pyyaml>=6.0,<7.0",
-    "slack-sdk>=3.30,<4.0",
-    "fastapi[standard]>=0.115,<1.0",
-    "httpx>=0.28,<1.0",
-    "openai>=1.0,<3.0",
-    "strands-agents[openai]>=1.0,<2.0",
-]
 
 [project.optional-dependencies]
 dev = [
     "boto3-stubs[s3]>=1.42,<2.0",
-    "pytest>=8.3,<10.0",
-    "ruff>=0.9,<1.0",
     "mypy>=1.14,<2.0",
+    "ruff>=0.9,<1.0",
+    "pytest>=8.3,<10.0",
     "types-pyyaml>=6.0,<7.0",
+    # Used only by scripts/evaluate.py; deliberately not in requirements.txt so
+    # the container image does not ship the evaluation harness.
+    "strands-agents-evals>=1.1,<2.0",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/knowledge_intelligence"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 100
@@ -45,4 +37,15 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 [tool.mypy]
 python_version = "3.14"
 strict = true
-files = ["src", "scripts"]
+files = ["app", "scripts"]
+
+# strands_evals ships no py.typed marker, so its symbols are Any to mypy.
+# Scope the relaxation to the evaluation script only; app/ stays fully strict.
+[[tool.mypy.overrides]]
+module = "strands_evals.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "evaluate"
+disallow_subclassing_any = false
+disallow_untyped_decorators = false

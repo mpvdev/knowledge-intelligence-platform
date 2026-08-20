@@ -66,14 +66,6 @@ class SearchResult(BaseModel):
         return self.chunk.title
 
 
-class SourceCitation(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    source_id: str
-    title: str
-    location: str
-
-
 class KnowledgeAnswer(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -81,7 +73,6 @@ class KnowledgeAnswer(BaseModel):
     visual: str | None = None
     suggested_questions: tuple[str, ...] = ()
     response_type: str = "general"
-    sources: tuple[SourceCitation, ...] = ()
 
 
 class KnowledgeQueryResponse(BaseModel):
@@ -124,7 +115,6 @@ class Repository(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
     url: str | None = None
     branch: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-    purpose: str | None = None
 
 
 class Component(BaseModel):

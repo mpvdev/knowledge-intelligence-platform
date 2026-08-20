@@ -51,6 +51,22 @@ class Settings(BaseSettings):
     feedback_prefix: str = "feedback/slack"
     admin_token: SecretStr = SecretStr("")
 
+    # Progressive Slack delivery: the answer fills in while it is generated.
+    slack_streaming_enabled: bool = True
+    slack_stream_interval_seconds: float = Field(default=1.0, ge=0.3, le=5.0)
+
+    # Persist each Slack thread's conversation so it survives a task restart.
+    session_persistence_enabled: bool = False
+    session_prefix: str = "sessions/slack"
+
+    # Summarize older turns instead of dropping them off a sliding window.
+    conversation_summarization_enabled: bool = False
+    conversation_summary_ratio: float = Field(default=0.3, ge=0.1, le=0.8)
+    conversation_preserve_recent_messages: int = Field(default=10, ge=2, le=50)
+
+    # Structured per-answer timing and retrieval metrics.
+    metrics_enabled: bool = True
+
     @model_validator(mode="after")
     def validate_optional_integrations(self) -> Settings:
         if self.github_enabled and not self.github_token.get_secret_value().strip():

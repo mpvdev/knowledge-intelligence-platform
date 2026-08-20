@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import struct
-from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from threading import RLock
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import BaseModel, ConfigDict
 
+from app.cache import LruCache
 from app.models import Chunk
 
 
@@ -32,13 +31,16 @@ class VectorStore:
         self.vector_bucket = vector_bucket
         self.index_name = index_name
         self.dimensions = dimensions
-        self.chunk_cache_size = chunk_cache_size
-        self._chunk_cache: OrderedDict[str, Chunk] = OrderedDict()
-        self._cache_lock = RLock()
+        self._chunk_cache: LruCache[Chunk] = LruCache(chunk_cache_size)
+        self._vector_format = struct.Struct(f"{dimensions}f")
         self._chunk_loader = ThreadPoolExecutor(
             max_workers=8,
             thread_name_prefix="knowledge-chunk",
         )
+
+    def close(self) -> None:
+        """Release the chunk-loading worker threads on shutdown."""
+        self._chunk_loader.shutdown(wait=False, cancel_futures=True)
 
     def reachable(self) -> bool:
         try:
@@ -175,10 +177,10 @@ class VectorStore:
             raise RuntimeError(
                 "Unable to persist a processed knowledge chunk."
             ) from exc
-        self._cache_chunk(chunk.chunk_id, chunk)
+        self._chunk_cache.put(chunk.chunk_id, chunk)
 
     def _load_chunk(self, chunk_id: str) -> Chunk | None:
-        cached = self._cached_chunk(chunk_id)
+        cached = self._chunk_cache.get(chunk_id)
         if cached is not None:
             return cached
         try:
@@ -191,26 +193,12 @@ class VectorStore:
                 chunk = Chunk.model_validate_json(body.read())
             finally:
                 body.close()
-            self._cache_chunk(chunk_id, chunk)
+            self._chunk_cache.put(chunk_id, chunk)
             return chunk
         except self.s3.exceptions.NoSuchKey:
             return None
         except (BotoCoreError, ClientError, ValueError) as exc:
             raise RuntimeError("Unable to load a processed knowledge chunk.") from exc
-
-    def _cached_chunk(self, chunk_id: str) -> Chunk | None:
-        with self._cache_lock:
-            chunk = self._chunk_cache.get(chunk_id)
-            if chunk is not None:
-                self._chunk_cache.move_to_end(chunk_id)
-            return chunk
-
-    def _cache_chunk(self, chunk_id: str, chunk: Chunk) -> None:
-        with self._cache_lock:
-            self._chunk_cache[chunk_id] = chunk
-            self._chunk_cache.move_to_end(chunk_id)
-            while len(self._chunk_cache) > self.chunk_cache_size:
-                self._chunk_cache.popitem(last=False)
 
     def _load_manifest(self) -> tuple[str, ...]:
         try:
@@ -235,7 +223,7 @@ class VectorStore:
     def _float32(self, values: tuple[float, ...]) -> tuple[float, ...]:
         if len(values) != self.dimensions:
             raise ValueError(f"Expected an embedding with {self.dimensions} values.")
-        return tuple(struct.unpack("f", struct.pack("f", value))[0] for value in values)
+        return self._vector_format.unpack(self._vector_format.pack(*values))
 
     @staticmethod
     def _chunk_key(chunk_id: str) -> str:

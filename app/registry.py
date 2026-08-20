@@ -47,20 +47,16 @@ class ComponentRegistry:
 
     def repositories(self) -> tuple[tuple[Component, str, str | None], ...]:
         return tuple(
-            (
-                component,
-                self._repository_name(repository.name, repository.url),
-                repository.branch,
-            )
+            (component, name, branch)
             for component in self.components
-            for repository in component.repositories
+            for name, branch in self._component_repositories(component)
         )
 
     def as_documents(self) -> tuple[ParsedDocument, ...]:
         documents: list[ParsedDocument] = []
         for component in self.components:
             repositories = ", ".join(
-                name for _, name, _ in self._component_repositories(component)
+                name for name, _ in self._component_repositories(component)
             )
             prefixes = ", ".join(component.documentation_prefixes)
             text = "\n".join(
@@ -93,13 +89,9 @@ class ComponentRegistry:
 
     def _component_repositories(
         self, component: Component
-    ) -> tuple[tuple[Component, str, str | None], ...]:
+    ) -> tuple[tuple[str, str | None], ...]:
         return tuple(
-            (
-                component,
-                self._repository_name(repository.name, repository.url),
-                repository.branch,
-            )
+            (self._repository_name(repository.name, repository.url), repository.branch)
             for repository in component.repositories
         )
 
@@ -118,7 +110,3 @@ class ComponentRegistry:
                 )
             return "/".join(parts)
         return name if "/" in name else f"{DEFAULT_GITHUB_ORGANIZATION}/{name}"
-
-
-def load_registry(directory: Path) -> ComponentRegistry:
-    return ComponentRegistry(directory)

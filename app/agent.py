@@ -2,22 +2,37 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from threading import Lock
+from time import monotonic
 from typing import Literal, cast
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from strands import Agent, AgentSkills, Skill
-from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.agent.conversation_manager import (
+    ConversationManager,
+    SlidingWindowConversationManager,
+    SummarizingConversationManager,
+)
 from strands.models.openai_responses import OpenAIResponsesModel
+from strands.session.s3_session_manager import S3SessionManager
+from strands.session.session_manager import SessionManager
 
-from app.models import KnowledgeAnswer, SearchResult, SourceCitation
+from app.metrics import AgentMetrics
+from app.models import KnowledgeAnswer, SearchResult
 from app.search import HybridSearch
 
-INSTRUCTIONS = """
+LOGGER = logging.getLogger(__name__)
+INSUFFICIENT_ANSWER = "I don't have enough information to answer that reliably."
+
+INSTRUCTIONS = f"""
 You are the TME Platform Knowledge Agent for application teams, TME users,
 operations teams, and new joiners.
 
@@ -41,6 +56,7 @@ Use an available presentation skill when the question is about onboarding,
 comparing services, or a supported workflow, architecture, lifecycle, or
 mapping. Skills only control the structure and presentation of a grounded
 answer. They do not provide facts or grant access to other information.
+Where a skill and these instructions disagree, these instructions win.
 
 Conversation style:
 
@@ -65,8 +81,10 @@ Output requirements:
   indexing, retrieval, tools, prompts, backend implementation, or phrases such
   as "from the available information", "based on the information provided",
   or "using the approved TME knowledge available in the conversation".
-- If information is insufficient, answer exactly: "I don't have enough
-  information to answer that reliably."
+- If information is insufficient, set answer to exactly this sentence and
+  nothing else: "{INSUFFICIENT_ANSWER}"
+  With that answer, set response_type to general, leave visual_nodes and
+  suggested_questions empty, and use no emojis.
 - Set response_type to onboarding for supported joining or getting-started
   guidance, comparison for supported service comparisons, mapping for supported
   workflows, architectures, lifecycles, or component mappings, and general
@@ -77,6 +95,9 @@ Output requirements:
 - Return 2-3 concise suggested_questions that are relevant to the current
   component and answerable from the retrieved results. Return none when they
   cannot be grounded.
+- visual_nodes and suggested_questions are rendered separately by the delivery
+  channel. Never restate them as lists inside answer, or the user sees them
+  twice.
 - Do not add a Sources section.
 """.strip()
 
@@ -98,7 +119,10 @@ the passages, sources, retrieval, or backend implementation to the user.
     return (
         Skill(
             name="guided-onboarding",
-            description="Present supported joining and getting-started guidance as a welcoming journey.",
+            description=(
+                "Present supported joining and getting-started guidance as a "
+                "welcoming journey."
+            ),
             instructions="\n\n".join(
                 (
                     grounding,
@@ -137,7 +161,10 @@ real relationship or sequence between the compared items.
         ),
         Skill(
             name="workflow-visualization",
-            description="Turn a supported TME workflow, architecture, lifecycle, or mapping into a Slack-ready high-level visual.",
+            description=(
+                "Turn a supported TME workflow, architecture, lifecycle, or mapping "
+                "into a Slack-ready high-level visual."
+            ),
             instructions="\n\n".join(
                 (
                     grounding,
@@ -158,10 +185,16 @@ nodes as a diagram; do not describe rendering details to the user.
 
 
 SOURCE_IDENTIFIER = re.compile(r"\s*(?:\[S\d+])+", re.IGNORECASE)
+# Matches both word orders: "the provided information" and "the information
+# provided". The instructions forbid these openers; this is the safety net.
 BACKEND_INTRO = re.compile(
-    r"^\s*(?:(?:from|based on)\s+(?:the\s+)?(?:available|provided|retrieved)\s+"
-    r"(?:information|content|details)|using\s+the\s+approved\s+TME\s+knowledge\s+"
-    r"available\s+in\s+the\s+conversation)\s*[:,.-]?\s*",
+    r"^\s*(?:"
+    r"(?:from|based on)\s+(?:the\s+)?(?:"
+    r"(?:available|provided|retrieved)\s+(?:information|content|details)"
+    r"|(?:information|content|details)\s+(?:available|provided|retrieved)"
+    r")"
+    r"|using\s+the\s+approved\s+TME\s+knowledge\s+available\s+in\s+the\s+conversation"
+    r")\s*[:,.-]?\s*",
     re.IGNORECASE,
 )
 
@@ -177,21 +210,114 @@ class IntelligentResponse(BaseModel):
     suggested_questions: tuple[str, ...] = Field(default=(), max_length=3)
 
 
+ANSWER_FIELD = re.compile(r'"answer"\s*:\s*"')
+
+
+class PartialAnswer:
+    """Extracts the `answer` field from a structured-output JSON stream.
+
+    The model streams the whole `IntelligentResponse` object, so raw deltas look
+    like `{"answer":"Yo` rather than prose. This decodes just the answer field
+    from whatever has arrived so far, tolerating a delta that ends mid-escape.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._start = -1
+
+    def feed(self, delta: str) -> None:
+        self._buffer += delta
+
+    def text(self) -> str | None:
+        if self._start < 0:
+            match = ANSWER_FIELD.search(self._buffer)
+            if match is None:
+                return None
+            self._start = match.end()
+        raw = self._buffer[self._start :]
+        decoded: list[str] = []
+        index = 0
+        while index < len(raw):
+            character = raw[index]
+            if character == "\\":
+                if index + 1 >= len(raw):
+                    break
+                if raw[index + 1] == "u":
+                    if index + 6 > len(raw):
+                        break
+                    decoded.append(raw[index : index + 6])
+                    index += 6
+                    continue
+                decoded.append(raw[index : index + 2])
+                index += 2
+                continue
+            if character == '"':
+                break
+            decoded.append(character)
+            index += 1
+        try:
+            text = cast(str, json.loads(f'"{"".join(decoded)}"'))
+        except ValueError:
+            return None
+        # An emoji is a surrogate pair that can arrive split across two deltas.
+        # A lone half is not encodable as UTF-8, so hold it back until it pairs.
+        if text and "\ud800" <= text[-1] <= "\udfff":
+            text = text[:-1]
+        return text
+
+
 def public_answer(answer: str) -> str:
     """Remove internal grounding identifiers from end-user content."""
     cleaned = SOURCE_IDENTIFIER.sub("", answer).strip()
     return BACKEND_INTRO.sub("", cleaned).strip()
 
 
-@dataclass
-class QueryEvidence:
-    results: dict[str, SearchResult] = field(default_factory=dict)
+def _condense(text: str) -> str:
+    """Normalise for comparison: straight quotes, single spaces, no end stop."""
+    normalized = text.replace("\u2019", "'").replace("\u2018", "'")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.strip('"').strip().rstrip(".").casefold()
+
+
+def is_refusal(answer: str) -> bool:
+    """True when the answer *is* the refusal, not merely one that mentions it."""
+    return _condense(answer) == _condense(INSUFFICIENT_ANSWER)
+
+
+def _diagram_nodes(nodes: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep ordered, de-duplicated nodes, and only if they form a real sequence."""
+    seen: dict[str, None] = {}
+    for node in nodes:
+        cleaned = re.sub(r"\s+", " ", public_answer(node)).strip()
+        if cleaned:
+            seen.setdefault(cleaned, None)
+    ordered = tuple(seen)
+    # A one-box "flow" is not a diagram; it just looks broken in Slack.
+    return ordered if len(ordered) >= 2 else ()
+
+
+def _follow_up_questions(answer: str, questions: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop follow-ups the answer already states, so nothing renders twice."""
+    body = _condense(answer)
+    kept: dict[str, None] = {}
+    for question in questions:
+        cleaned = re.sub(r"\s+", " ", public_answer(question)).strip()
+        if not cleaned:
+            continue
+        if _condense(cleaned) in body:
+            continue
+        kept.setdefault(cleaned, None)
+    return tuple(kept)[:3]
+
+
+def _session_id(conversation_id: str) -> str:
+    """Slack ids contain characters that do not belong in a storage key."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", conversation_id).strip("-") or "default"
 
 
 @dataclass
 class Conversation:
     agent: Agent
-    evidence: QueryEvidence
     updated_at: datetime
     previous_question: str | None = None
     lock: Lock = field(default_factory=Lock)
@@ -206,10 +332,28 @@ class PlatformKnowledgeAgent:
         search: HybridSearch,
         maximum_results: int,
         conversation_window: int = 20,
+        metrics_enabled: bool = True,
+        stream_interval_seconds: float = 1.0,
+        summarization_enabled: bool = False,
+        summary_ratio: float = 0.3,
+        preserve_recent_messages: int = 10,
+        session_persistence_enabled: bool = False,
+        session_bucket: str | None = None,
+        session_prefix: str = "sessions/slack",
+        aws_region: str | None = None,
     ) -> None:
         self.search = search
         self.maximum_results = maximum_results
         self.conversation_window = conversation_window
+        self.metrics_enabled = metrics_enabled
+        self.stream_interval_seconds = stream_interval_seconds
+        self.summarization_enabled = summarization_enabled
+        self.summary_ratio = summary_ratio
+        self.preserve_recent_messages = preserve_recent_messages
+        self.session_persistence_enabled = session_persistence_enabled
+        self.session_bucket = session_bucket
+        self.session_prefix = session_prefix
+        self.aws_region = aws_region
         self.model = OpenAIResponsesModel(
             model_id=model_id,
             client_args={"api_key": api_key},
@@ -224,45 +368,99 @@ class PlatformKnowledgeAgent:
         *,
         conversation_id: str | None = None,
     ) -> KnowledgeAnswer:
-        conversation = (
-            self._conversation(conversation_id)
-            if conversation_id
-            else self._new_conversation()
-        )
+        conversation = self._for(conversation_id)
         with conversation.lock:
-            normalized_question = question.strip()
-            conversation.evidence.results.clear()
-            retrieval_query = self._retrieval_query(
-                normalized_question,
-                conversation.previous_question,
-            )
-            raw_results = self.search.search(retrieval_query, self.maximum_results)
-            results = tuple(
-                result.model_copy(update={"source_id": f"S{position}"})
-                for position, result in enumerate(raw_results, start=1)
-            )
-            conversation.evidence.results.update(
-                {result.source_id: result for result in results}
-            )
-            conversation.previous_question = normalized_question
-            conversation.updated_at = datetime.now(UTC)
-            if not results:
-                return KnowledgeAnswer(
-                    answer="I don't have enough information to answer that reliably."
-                )
+            prompt = self._prepare(conversation, question)
+            if prompt is None:
+                return KnowledgeAnswer(answer=INSUFFICIENT_ANSWER)
             result = conversation.agent(
-                self._grounded_prompt(normalized_question, results),
+                prompt,
                 structured_output_model=IntelligentResponse,
             )
             structured = cast(IntelligentResponse | None, result.structured_output)
             response = structured or IntelligentResponse(answer=str(result).strip())
-            return self._knowledge_answer(response, conversation.evidence)
+            return self._knowledge_answer(response)
 
-    def _new_conversation(self) -> Conversation:
-        evidence = QueryEvidence()
+    def answer_stream(
+        self,
+        question: str,
+        *,
+        conversation_id: str | None = None,
+        on_partial: Callable[[str], None] | None = None,
+    ) -> KnowledgeAnswer:
+        """Answer while reporting the answer text as it is generated.
+
+        `on_partial` is called at most once per `stream_interval_seconds` with the
+        answer so far, so a delivery channel can update a message progressively.
+        """
+        conversation = self._for(conversation_id)
+        with conversation.lock:
+            prompt = self._prepare(conversation, question)
+            if prompt is None:
+                return KnowledgeAnswer(answer=INSUFFICIENT_ANSWER)
+            return asyncio.run(self._stream(conversation, prompt, on_partial))
+
+    async def _stream(
+        self,
+        conversation: Conversation,
+        prompt: str,
+        on_partial: Callable[[str], None] | None,
+    ) -> KnowledgeAnswer:
+        partial = PartialAnswer()
+        structured: IntelligentResponse | None = None
+        emitted_at = 0.0
+        emitted = ""
+        async for event in conversation.agent.stream_async(
+            prompt,
+            structured_output_model=IntelligentResponse,
+        ):
+            if not isinstance(event, dict):
+                continue
+            output = event.get("structured_output")
+            if isinstance(output, IntelligentResponse):
+                structured = output
+            delta = event.get("data")
+            if not isinstance(delta, str) or not delta:
+                continue
+            partial.feed(delta)
+            if on_partial is None:
+                continue
+            now = monotonic()
+            if now - emitted_at < self.stream_interval_seconds:
+                continue
+            text = partial.text()
+            if text and text != emitted:
+                emitted, emitted_at = text, now
+                on_partial(text)
+        if structured is None:
+            text = (partial.text() or "").strip()
+            structured = IntelligentResponse(answer=text or INSUFFICIENT_ANSWER)
+        return self._knowledge_answer(structured)
+
+    def _prepare(self, conversation: Conversation, question: str) -> str | None:
+        """Retrieve for this turn and build the grounded prompt, or None if empty."""
+        normalized_question = question.strip()
+        retrieval_query = self._retrieval_query(
+            normalized_question,
+            conversation.previous_question,
+        )
+        results = self.search.search(retrieval_query, self.maximum_results)
+        conversation.previous_question = normalized_question
+        conversation.updated_at = datetime.now(UTC)
+        if not results:
+            return None
+        return self._grounded_prompt(normalized_question, results)
+
+    def _for(self, conversation_id: str | None) -> Conversation:
+        if conversation_id:
+            return self._conversation(conversation_id)
+        return self._new_conversation(f"ephemeral:{uuid4()}", persist=False)
+
+    def _new_conversation(
+        self, conversation_id: str, *, persist: bool = True
+    ) -> Conversation:
         return Conversation(
-            agent=self._build_agent(),
-            evidence=evidence,
+            agent=self._build_agent(conversation_id, persist=persist),
             updated_at=datetime.now(UTC),
         )
 
@@ -276,21 +474,53 @@ class PlatformKnowledgeAgent:
             }
             conversation = self._conversations.get(conversation_id)
             if conversation is None:
-                conversation = self._new_conversation()
+                conversation = self._new_conversation(conversation_id)
                 self._conversations[conversation_id] = conversation
             return conversation
 
-    def _build_agent(self) -> Agent:
-        return Agent(
+    def _build_agent(self, conversation_id: str, *, persist: bool = True) -> Agent:
+        agent = Agent(
             model=self.model,
             system_prompt=INSTRUCTIONS,
             plugins=[AgentSkills(skills=list(_presentation_skills()), strict=True)],
-            conversation_manager=SlidingWindowConversationManager(
-                window_size=self.conversation_window,
-                should_truncate_results=True,
-                per_turn=True,
-            ),
+            conversation_manager=self._conversation_manager(),
+            session_manager=self._session_manager(conversation_id) if persist else None,
         )
+        if self.metrics_enabled:
+            AgentMetrics(conversation_id=conversation_id).register(agent)
+        return agent
+
+    def _conversation_manager(self) -> ConversationManager:
+        if self.summarization_enabled:
+            return SummarizingConversationManager(
+                summary_ratio=self.summary_ratio,
+                preserve_recent_messages=self.preserve_recent_messages,
+            )
+        return SlidingWindowConversationManager(
+            window_size=self.conversation_window,
+            should_truncate_results=True,
+            per_turn=True,
+        )
+
+    def _session_manager(self, conversation_id: str) -> SessionManager | None:
+        if not self.session_persistence_enabled or not self.session_bucket:
+            return None
+        # S3SessionManager reads the stored session during construction, so this
+        # touches S3 on the request path. Losing durable history must never cost
+        # the user their answer: fall back to an in-memory conversation instead.
+        try:
+            return S3SessionManager(
+                session_id=_session_id(conversation_id),
+                bucket=self.session_bucket,
+                prefix=self.session_prefix,
+                region_name=self.aws_region,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Conversation persistence unavailable; continuing without it.",
+                extra={"operation": "session_manager", "component": "agent"},
+            )
+            return None
 
     @staticmethod
     def _retrieval_query(question: str, previous_question: str | None) -> str:
@@ -334,34 +564,20 @@ class PlatformKnowledgeAgent:
         )
 
     @staticmethod
-    def _knowledge_answer(
-        response: IntelligentResponse,
-        evidence: QueryEvidence,
-    ) -> KnowledgeAnswer:
-        visual = "\n↓\n".join(response.visual_nodes) if response.visual_nodes else None
-        content = "\n".join(
-            (
-                response.answer,
-                visual or "",
-                *response.suggested_questions,
-            )
-        )
-        cited = sorted(
-            set(re.findall(r"\[(S\d+)]", content)),
-            key=lambda source_id: int(source_id[1:]),
-        )
+    def _knowledge_answer(response: IntelligentResponse) -> KnowledgeAnswer:
+        """Normalise the model's structured output into what the channel renders.
+
+        The prompt asks for these rules; this enforces them, so a model that
+        drifts cannot put follow-up buttons or a flow diagram under a refusal,
+        or restate content the delivery channel already renders separately.
+        """
+        answer = response.answer.strip()
+        if not answer or is_refusal(answer):
+            return KnowledgeAnswer(answer=INSUFFICIENT_ANSWER)
+        nodes = _diagram_nodes(response.visual_nodes)
         return KnowledgeAnswer(
-            answer=response.answer,
-            visual=visual,
-            suggested_questions=response.suggested_questions,
+            answer=answer,
+            visual="\n↓\n".join(nodes) if nodes else None,
+            suggested_questions=_follow_up_questions(answer, response.suggested_questions),
             response_type=response.response_type,
-            sources=tuple(
-                SourceCitation(
-                    source_id=source_id,
-                    title=evidence.results[source_id].chunk.title,
-                    location=evidence.results[source_id].citation,
-                )
-                for source_id in cited
-                if source_id in evidence.results
-            ),
         )

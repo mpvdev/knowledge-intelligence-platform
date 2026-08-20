@@ -5,6 +5,8 @@ import re
 
 from app.models import Chunk, ParsedDocument
 
+BLANK_LINES = re.compile(r"\n{3,}")
+
 
 def chunk_document(
     document: ParsedDocument,
@@ -48,7 +50,7 @@ def _split(text: str, maximum: int, overlap: int) -> tuple[str, ...]:
             )
             if boundary > start + maximum // 2:
                 end = boundary + 1
-        part = re.sub(r"\n{3,}", "\n\n", normalized[start:end]).strip()
+        part = BLANK_LINES.sub("\n\n", normalized[start:end]).strip()
         if part:
             parts.append(part)
         if end == len(normalized):

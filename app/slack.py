@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -12,13 +13,13 @@ from uuid import UUID, uuid4
 
 import boto3
 import httpx
-from app.diagram import render_flow
 from botocore.exceptions import BotoCoreError, ClientError
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
 
 from app.agent import PlatformKnowledgeAgent, public_answer
+from app.diagram import render_flow
 from app.models import KnowledgeAnswer
 
 LOGGER = logging.getLogger(__name__)
@@ -85,11 +86,13 @@ class SlackIntegration:
         agent: PlatformKnowledgeAgent,
         maximum_message_length: int,
         feedback_store: FeedbackStore,
+        streaming_enabled: bool = True,
     ) -> None:
         self.client = WebClient(token=bot_token)
         self.verifier = SignatureVerifier(signing_secret=signing_secret)
         self.agent = agent
         self.maximum_message_length = maximum_message_length
+        self.streaming_enabled = streaming_enabled
         self.feedback_store = feedback_store
         self._events: dict[str, datetime] = {}
         self._lock = Lock()
@@ -136,9 +139,15 @@ class SlackIntegration:
             "Got it 👋 I’m looking into that now…",
             (),
         )
+        partial_update = (
+            self._partial_updater(channel, progress_ts)
+            if progress_ts and self.streaming_enabled
+            else None
+        )
         answer, blocks, visual = self._answer(
             question,
             conversation_id=f"{channel}:{thread_ts}",
+            on_partial=partial_update,
         )
         if progress_ts:
             self._update(channel, progress_ts, answer, blocks)
@@ -174,14 +183,30 @@ class SlackIntegration:
                 extra={"operation": "respond_to_command", "component": "slack"},
             )
 
+    def _partial_updater(self, channel: str, timestamp: str) -> Callable[[str], None]:
+        """Return a callback that grows the placeholder message as text arrives."""
+
+        def update(text: str) -> None:
+            self._update(channel, timestamp, _streaming_preview(text), ())
+
+        return update
+
     def _answer(
         self,
         question: str,
         *,
         conversation_id: str,
+        on_partial: Callable[[str], None] | None = None,
     ) -> tuple[str, tuple[dict[str, object], ...], str | None]:
         try:
-            result = self.agent.answer(question, conversation_id=conversation_id)
+            if on_partial is not None:
+                result = self.agent.answer_stream(
+                    question,
+                    conversation_id=conversation_id,
+                    on_partial=on_partial,
+                )
+            else:
+                result = self.agent.answer(question, conversation_id=conversation_id)
             answer = public_answer(result.answer)
             blocks = self._blocks(result, answer)
             visual = result.visual
@@ -476,6 +501,14 @@ def _visual_blocks(title: str, visual: str) -> tuple[dict[str, object], ...]:
                 }
             )
     return tuple(blocks)
+
+
+def _streaming_preview(text: str) -> str:
+    """Trim in-progress text for Slack and mark it as still being written."""
+    cleaned = public_answer(text)
+    if len(cleaned) > 2_800:
+        cleaned = f"{cleaned[:2_800].rstrip()}…"
+    return f"{cleaned} ▌"
 
 
 def _button_text(question: str) -> str:

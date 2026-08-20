@@ -122,6 +122,7 @@ app/
     registry.py
     agent.py
     pdf_parser.py
+    diagram.py
     diagram_analysis.py
     markdown_parser.py
     s3_reader.py

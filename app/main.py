@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -105,6 +106,15 @@ def build_application(settings: Settings) -> Application:
         search=search,
         maximum_results=settings.agent_max_search_results,
         conversation_window=settings.slack_conversation_window,
+        metrics_enabled=settings.metrics_enabled,
+        stream_interval_seconds=settings.slack_stream_interval_seconds,
+        summarization_enabled=settings.conversation_summarization_enabled,
+        summary_ratio=settings.conversation_summary_ratio,
+        preserve_recent_messages=settings.conversation_preserve_recent_messages,
+        session_persistence_enabled=settings.session_persistence_enabled,
+        session_bucket=settings.s3_bucket,
+        session_prefix=settings.session_prefix,
+        aws_region=settings.aws_region,
     )
     github = (
         GitHubReader(
@@ -144,6 +154,7 @@ def build_application(settings: Settings) -> Application:
             signing_secret=settings.slack_signing_secret.get_secret_value(),
             agent=agent,
             maximum_message_length=settings.slack_max_message_length,
+            streaming_enabled=settings.slack_streaming_enabled,
             feedback_store=FeedbackStore(
                 region=settings.aws_region,
                 bucket=settings.s3_bucket,
@@ -172,6 +183,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
     application: Application = fastapi_app.state.application
     if application.ingestion.github:
         application.ingestion.github.close()
+    application.ingestion.vectors.close()
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -244,7 +256,7 @@ def reindex(
         raise HTTPException(
             status_code=503, detail="Administrative reindexing is not configured."
         )
-    if x_admin_token != configured:
+    if x_admin_token is None or not secrets.compare_digest(x_admin_token, configured):
         raise HTTPException(
             status_code=401, detail="Invalid administrative credentials."
         )
@@ -260,98 +272,92 @@ def reindex(
         current.reindex_lock.release()
 
 
-@app.post("/slack/events")
-async def slack_events(
-    request: Request, background_tasks: BackgroundTasks
+SLASH_COMMAND = "/ask-tme"
+SLACK_RESPONSE_HOST = "hooks.slack.com"
+
+
+def _ephemeral(text: str) -> JSONResponse:
+    return JSONResponse({"response_type": "ephemeral", "text": text})
+
+
+def _handle_slash_command(
+    current: Application,
+    form: dict[str, list[str]],
+    background_tasks: BackgroundTasks,
 ) -> JSONResponse:
-    current = application(request)
     if current.slack is None:
         raise HTTPException(status_code=503, detail="Slack integration is not enabled.")
-    body = await request.body()
-    if not current.slack.verify(
-        body,
-        request.headers.get("X-Slack-Request-Timestamp"),
-        request.headers.get("X-Slack-Signature"),
+    if form.get("command", [""])[0] != SLASH_COMMAND:
+        return _ephemeral("That command is not supported.")
+    question = form.get("text", [""])[0].strip()
+    if not question:
+        return _ephemeral(
+            f"Hi 👋 What would you like to know about TME? Try `{SLASH_COMMAND} What is TME?`"
+        )
+    response_url = form.get("response_url", [""])[0]
+    parsed_response_url = urlparse(response_url)
+    if (
+        parsed_response_url.scheme != "https"
+        or parsed_response_url.hostname != SLACK_RESPONSE_HOST
     ):
-        raise HTTPException(status_code=401, detail="Invalid Slack request signature.")
-    if request.headers.get("content-type", "").startswith(
-        "application/x-www-form-urlencoded"
-    ):
-        form = parse_qs(body.decode("utf-8"), keep_blank_values=True)
-        command = form.get("command", [""])[0]
-        if command:
-            if command != "/ask-tme":
-                return JSONResponse(
-                    {
-                        "response_type": "ephemeral",
-                        "text": "That command is not supported.",
-                    }
-                )
-            question = form.get("text", [""])[0].strip()
-            if not question:
-                return JSONResponse(
-                    {
-                        "response_type": "ephemeral",
-                        "text": (
-                            "Hi 👋 What would you like to know about TME? "
-                            "Try `/ask-tme What is TME?`"
-                        ),
-                    }
-                )
-            response_url = form.get("response_url", [""])[0]
-            parsed_response_url = urlparse(response_url)
-            if (
-                parsed_response_url.scheme != "https"
-                or parsed_response_url.hostname != "hooks.slack.com"
-            ):
-                raise HTTPException(
-                    status_code=400, detail="Invalid Slack response URL."
-                )
-            channel_id = form.get("channel_id", [""])[0]
-            user_id = form.get("user_id", [""])[0]
-            background_tasks.add_task(
-                current.slack.process_slash,
-                question,
-                response_url,
-                f"slash:{channel_id}:{user_id}",
-            )
-            return JSONResponse(
-                {
-                    "response_type": "in_channel",
-                    "text": "Got it 👋 I'm looking into that now.",
-                }
-            )
-        encoded_payload = form.get("payload", [""])[0]
-        try:
-            interaction = json.loads(encoded_payload)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(
-                status_code=400, detail="Invalid Slack interaction payload."
-            ) from exc
-        if not isinstance(interaction, dict):
-            raise HTTPException(
-                status_code=400, detail="Invalid Slack interaction payload."
-            )
-        action = current.slack.parse_action(interaction)
-        if action is None:
-            return JSONResponse({"ok": True})
-        if (
-            action.kind == "followup"
-            and action.channel
-            and action.thread_ts
-            and action.question
-        ):
-            background_tasks.add_task(
-                current.slack.process,
-                action.channel,
-                action.thread_ts,
-                action.question,
-            )
-            return JSONResponse({"ok": True})
-        if action.kind == "feedback":
-            background_tasks.add_task(current.slack.feedback_store.record, action)
-            return JSONResponse({"ok": True})
+        raise HTTPException(status_code=400, detail="Invalid Slack response URL.")
+    channel_id = form.get("channel_id", [""])[0]
+    user_id = form.get("user_id", [""])[0]
+    background_tasks.add_task(
+        current.slack.process_slash,
+        question,
+        response_url,
+        f"slash:{channel_id}:{user_id}",
+    )
+    return JSONResponse(
+        {"response_type": "in_channel", "text": "Got it 👋 I'm looking into that now."}
+    )
+
+
+def _handle_interaction(
+    current: Application,
+    form: dict[str, list[str]],
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
+    if current.slack is None:
+        raise HTTPException(status_code=503, detail="Slack integration is not enabled.")
+    try:
+        interaction = json.loads(form.get("payload", [""])[0])
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400, detail="Invalid Slack interaction payload."
+        ) from exc
+    if not isinstance(interaction, dict):
+        raise HTTPException(
+            status_code=400, detail="Invalid Slack interaction payload."
+        )
+    action = current.slack.parse_action(interaction)
+    if action is None:
         return JSONResponse({"ok": True})
+    if (
+        action.kind == "followup"
+        and action.channel
+        and action.thread_ts
+        and action.question
+    ):
+        background_tasks.add_task(
+            current.slack.process,
+            action.channel,
+            action.thread_ts,
+            action.question,
+        )
+    elif action.kind == "feedback":
+        background_tasks.add_task(current.slack.feedback_store.record, action)
+    return JSONResponse({"ok": True})
+
+
+def _handle_event(
+    current: Application,
+    body: bytes,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
+    if current.slack is None:
+        raise HTTPException(status_code=503, detail="Slack integration is not enabled.")
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -388,17 +394,44 @@ async def slack_events(
     return JSONResponse({"ok": True})
 
 
+@app.post("/slack/events")
+async def slack_events(
+    request: Request, background_tasks: BackgroundTasks
+) -> JSONResponse:
+    current = application(request)
+    if current.slack is None:
+        raise HTTPException(status_code=503, detail="Slack integration is not enabled.")
+    body = await request.body()
+    if not current.slack.verify(
+        body,
+        request.headers.get("X-Slack-Request-Timestamp"),
+        request.headers.get("X-Slack-Signature"),
+    ):
+        raise HTTPException(status_code=401, detail="Invalid Slack request signature.")
+    if not request.headers.get("content-type", "").startswith(
+        "application/x-www-form-urlencoded"
+    ):
+        return _handle_event(current, body, background_tasks)
+    form = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    if form.get("command", [""])[0]:
+        return _handle_slash_command(current, form, background_tasks)
+    return _handle_interaction(current, form, background_tasks)
+
+
 @app.exception_handler(Exception)
 async def unhandled_error(request: Request, error: Exception) -> JSONResponse:
+    correlation_id = getattr(request.state, "correlation_id", "")
     LOGGER.exception(
         "Unhandled request failure.",
         extra={
-            "correlation_id": getattr(request.state, "correlation_id", ""),
+            "correlation_id": correlation_id,
             "operation": f"{request.method} {request.url.path}",
             "component": "api",
         },
     )
+    # Error responses bypass the logging middleware, so echo the id here too.
     return JSONResponse(
         status_code=500,
         content={"message": "The request could not be completed."},
+        headers={"X-Correlation-ID": correlation_id} if correlation_id else None,
     )

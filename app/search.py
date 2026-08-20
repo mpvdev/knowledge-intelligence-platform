@@ -7,7 +7,7 @@ from collections import Counter
 from threading import RLock
 from time import monotonic
 
-from app.embeddings import EmbeddingUnavailableError, Embeddings
+from app.embeddings import Embeddings, EmbeddingUnavailableError
 from app.models import Chunk, SearchResult
 from app.vector_store import VectorStore
 
@@ -52,28 +52,28 @@ class HybridSearch:
         self.embeddings = embeddings
         self.vectors = vectors
         self.top_k = top_k
-        self._chunks: tuple[Chunk, ...] = ()
-        self._frequencies: dict[str, Counter[str]] = {}
-        self._document_frequency: Counter[str] = Counter()
         self._chunks_by_id: dict[str, Chunk] = {}
+        self._postings: dict[str, tuple[tuple[str, float], ...]] = {}
         self._lock = RLock()
 
     @property
     def cached_chunk_count(self) -> int:
         with self._lock:
-            return len(self._chunks)
+            return len(self._chunks_by_id)
 
     def replace_keyword_cache(self, chunks: tuple[Chunk, ...]) -> None:
-        frequencies = {
-            chunk.chunk_id: Counter(_tokens(_searchable(chunk))) for chunk in chunks
-        }
+        """Build an inverted index so a query only visits chunks that match it."""
+        postings: dict[str, list[tuple[str, float]]] = {}
+        for chunk in chunks:
+            counts = Counter(_tokens(_searchable(chunk)))
+            total = counts.total()
+            if not total:
+                continue
+            for term, count in counts.items():
+                postings.setdefault(term, []).append((chunk.chunk_id, count / total))
         with self._lock:
-            self._chunks = chunks
-            self._frequencies = frequencies
-            self._document_frequency = Counter(
-                term for chunk_terms in frequencies.values() for term in chunk_terms
-            )
             self._chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+            self._postings = {term: tuple(entries) for term, entries in postings.items()}
 
     def search(self, query: str, limit: int) -> tuple[SearchResult, ...]:
         normalized = query.strip()
@@ -111,7 +111,7 @@ class HybridSearch:
 
     def _restore_keyword_cache_if_empty(self) -> None:
         with self._lock:
-            if self._chunks:
+            if self._chunks_by_id:
                 return
         try:
             chunks = self.vectors.load_chunks()
@@ -131,24 +131,19 @@ class HybridSearch:
     def _keyword(self, query: str, limit: int) -> tuple[tuple[Chunk, float], ...]:
         terms = tuple(dict.fromkeys(_tokens(query)))
         with self._lock:
-            chunks = self._chunks
-            frequencies = self._frequencies
-            document_frequency = self._document_frequency
+            postings = self._postings
             by_id = self._chunks_by_id
-        if not terms or not chunks:
+        if not terms or not by_id:
             return ()
+        total_chunks = len(by_id)
         scores: dict[str, float] = {}
-        for chunk_id, counts in frequencies.items():
-            total = counts.total()
-            score = sum(
-                counts[term]
-                / total
-                * (math.log((len(chunks) + 1) / (document_frequency[term] + 1)) + 1)
-                for term in terms
-                if counts[term]
-            )
-            if score:
-                scores[chunk_id] = score
+        for term in terms:
+            entries = postings.get(term)
+            if not entries:
+                continue
+            weight = math.log((total_chunks + 1) / (len(entries) + 1)) + 1
+            for chunk_id, frequency in entries:
+                scores[chunk_id] = scores.get(chunk_id, 0.0) + frequency * weight
         return tuple(
             (by_id[chunk_id], scores[chunk_id])
             for chunk_id in sorted(scores, key=lambda item: (-scores[item], item))[
