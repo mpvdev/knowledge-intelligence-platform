@@ -37,7 +37,7 @@ data "aws_iam_policy_document" "ecs_execution_secrets" {
     ]
 
     resources = [
-      aws_secretsmanager_secret.application.arn
+      data.aws_secretsmanager_secret.application.arn
     ]
   }
 }
@@ -155,6 +155,13 @@ data "aws_iam_policy_document" "feedback_write" {
     effect    = "Allow"
     actions   = ["s3:PutObject"]
     resources = ["arn:aws:s3:::${var.knowledge_bucket_name}/${trim(var.feedback_prefix, "/")}/*"]
+  }
+
+  statement {
+    sid       = "WriteSlackDiagrams"
+    effect    = "Allow"
+    actions   = ["s3:PutObject", "s3:GetObject"]
+    resources = ["arn:aws:s3:::${var.knowledge_bucket_name}/${trim(var.diagram_prefix, "/")}/*"]
   }
 }
 

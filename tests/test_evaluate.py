@@ -108,25 +108,90 @@ def test_missing_dataset_directory_is_rejected(tmp_path: Path) -> None:
 
 
 def test_report_summarises_by_evaluator_and_category() -> None:
-    class FakeReport:
+    class StaleShapeReport:
         def to_dict(self) -> dict[str, Any]:
             return {
                 "cases": [
                     {
-                        "name": "s-1", "evaluator": "refusal-discipline", "score": 1.0,
-                        "test_pass": True, "metadata": {"category": "supported"},
+                        "name": "s-1",
+                        "evaluator": "refusal-discipline",
+                        "metadata": {"category": "supported"},
                     },
                     {
-                        "name": "u-1", "evaluator": "refusal-discipline", "score": 0.0,
-                        "test_pass": False, "reason": "Expected a refusal.",
+                        "name": "u-1",
+                        "evaluator": "refusal-discipline",
                         "metadata": {"category": "unsupported"},
                     },
-                ]
+                ],
+                "scores": [1.0, 0.0],
+                "test_passes": [True, False],
+                "reasons": ["Refusal behaviour matched.", "Expected a refusal."],
             }
 
-    markdown = evaluate.render_report(FakeReport(), judged=False)
+    markdown = evaluate.render_report(StaleShapeReport(), judged=False)
     assert "| refusal-discipline |" in markdown
     assert "| supported |" in markdown and "| unsupported |" in markdown
     assert "Expected a refusal." in markdown
     assert "Pass rate: **50%**" in markdown
     assert "deterministic evaluators only" in markdown
+
+
+class FakeReport:
+    """Mirrors the parallel-array shape strands_evals returns from to_dict()."""
+
+    def __init__(self, document: dict[str, Any]) -> None:
+        self.document = document
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.document
+
+
+DOCUMENT = {
+    "cases": [
+        {
+            "name": "alpha-001",
+            "evaluator": "coverage",
+            "metadata": {"category": "supported"},
+        },
+        {
+            "name": "beta-001",
+            "evaluator": "coverage",
+            "metadata": {"category": "unsupported"},
+        },
+    ],
+    "scores": [1.0, 0.25],
+    "test_passes": [True, False],
+    "reasons": ["matched 2 of 2", "matched 0 of 2"],
+}
+
+
+def test_scores_are_read_from_the_parallel_arrays() -> None:
+    rows = _load_module().collect_rows(FakeReport(DOCUMENT))
+
+    assert [row["score"] for row in rows] == [1.0, 0.25]
+    assert [row["test_pass"] for row in rows] == [True, False]
+    assert [row["reason"] for row in rows] == ["matched 2 of 2", "matched 0 of 2"]
+    assert [row["name"] for row in rows] == ["alpha-001", "beta-001"]
+
+
+def test_a_passing_case_is_not_reported_as_a_failure() -> None:
+    markdown = _load_module().render_report(FakeReport(DOCUMENT), judged=False)
+
+    assert "Pass rate: **50%**" in markdown
+    failures = markdown.split("## Failures")[1]
+    assert "alpha-001" not in failures
+    assert "beta-001" in failures
+
+
+def test_a_failure_reason_reaches_the_report() -> None:
+    markdown = _load_module().render_report(FakeReport(DOCUMENT), judged=False)
+
+    assert "matched 0 of 2" in markdown
+
+
+def test_missing_outcome_arrays_do_not_crash_the_report() -> None:
+    document = {"cases": DOCUMENT["cases"], "scores": [], "test_passes": [], "reasons": []}
+    rows = _load_module().collect_rows(FakeReport(document))
+
+    assert [row["score"] for row in rows] == [0.0, 0.0]
+    assert all(row["test_pass"] is False for row in rows)

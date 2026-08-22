@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app.agent import (
     INSUFFICIENT_ANSWER,
+    IntelligentBranch,
     IntelligentResponse,
     PlatformKnowledgeAgent,
     is_refusal,
@@ -141,3 +144,122 @@ def test_instructions_use_the_refusal_constant() -> None:
 
     assert INSUFFICIENT_ANSWER in INSTRUCTIONS
     assert "{" not in INSTRUCTIONS and "}" not in INSTRUCTIONS
+
+
+def test_instructions_ship_beside_the_package() -> None:
+    from app.agent import INSTRUCTIONS_PATH
+
+    assert INSTRUCTIONS_PATH.name == "instructions.md"
+    assert INSTRUCTIONS_PATH.parent.name == "app"
+    assert INSTRUCTIONS_PATH.is_file()
+
+
+def test_a_literal_brace_in_the_instructions_is_harmless(tmp_path: Path) -> None:
+    from app.agent import INSUFFICIENT_ANSWER as refusal
+
+    source = tmp_path / "instructions.md"
+    source.write_text('Return JSON like {"answer": "x"}. Refuse with "{INSUFFICIENT_ANSWER}"')
+    rendered = source.read_text().replace("{INSUFFICIENT_ANSWER}", refusal)
+
+    assert refusal in rendered
+    assert '{"answer": "x"}' in rendered
+
+
+def test_every_structured_field_is_named_in_the_instructions() -> None:
+    from app.agent import INSTRUCTIONS, IntelligentResponse
+
+    for field in IntelligentResponse.model_fields:
+        assert field in INSTRUCTIONS, field
+
+
+def branch(label: str, *items: str) -> IntelligentBranch:
+    return IntelligentBranch(label=label, items=items)
+
+
+def test_a_map_needs_a_subject_and_two_branches() -> None:
+    response = IntelligentResponse(
+        answer="TME covers several areas.",
+        visual_center="TME",
+        visual_branches=(branch("Purpose", "Compliance"), branch("Coverage", "UK")),
+    )
+    result = normalise(response)
+    assert result.mindmap is not None
+    assert result.mindmap.center == "TME"
+    assert [item.label for item in result.mindmap.branches] == ["Purpose", "Coverage"]
+
+
+def test_a_map_without_a_subject_is_dropped() -> None:
+    response = IntelligentResponse(
+        answer="x",
+        visual_center="   ",
+        visual_branches=(branch("Purpose", "a"), branch("Coverage", "b")),
+    )
+    assert normalise(response).mindmap is None
+
+
+def test_a_single_branch_is_not_a_map() -> None:
+    response = IntelligentResponse(
+        answer="x", visual_center="TME", visual_branches=(branch("Purpose", "a"),)
+    )
+    assert normalise(response).mindmap is None
+
+
+def test_a_sequence_wins_over_a_map() -> None:
+    response = IntelligentResponse(
+        answer="x",
+        visual_nodes=("Request", "Approve"),
+        visual_center="TME",
+        visual_branches=(branch("Purpose", "a"), branch("Coverage", "b")),
+    )
+    result = normalise(response)
+    assert result.visual == "Request\n↓\nApprove"
+    assert result.mindmap is None
+
+
+def test_a_refusal_cannot_carry_a_map() -> None:
+    response = IntelligentResponse(
+        answer=INSUFFICIENT_ANSWER,
+        visual_center="TME",
+        visual_branches=(branch("Purpose", "a"), branch("Coverage", "b")),
+    )
+    assert normalise(response).mindmap is None
+
+
+def test_source_markers_never_reach_a_map() -> None:
+    response = IntelligentResponse(
+        answer="x",
+        visual_center="TME [S1]",
+        visual_branches=(branch("Purpose [S2]", "Compliance [S3]"), branch("Coverage", "UK")),
+    )
+    mindmap = normalise(response).mindmap
+    assert mindmap is not None
+    assert mindmap.center == "TME"
+    assert mindmap.branches[0].label == "Purpose"
+    assert mindmap.branches[0].items == ("Compliance",)
+
+
+def test_repeated_branches_and_items_collapse() -> None:
+    response = IntelligentResponse(
+        answer="x",
+        visual_center="TME",
+        visual_branches=(
+            branch("Purpose", "Compliance", "Compliance", "  "),
+            branch("purpose", "ignored"),
+            branch("Coverage", "UK"),
+        ),
+    )
+    mindmap = normalise(response).mindmap
+    assert mindmap is not None
+    assert [item.label for item in mindmap.branches] == ["Purpose", "Coverage"]
+    assert mindmap.branches[0].items == ("Compliance",)
+
+
+def test_an_item_repeating_its_branch_is_dropped() -> None:
+    response = IntelligentResponse(
+        answer="x",
+        visual_center="TME",
+        visual_branches=(branch("Purpose", "purpose", "Compliance"), branch("Coverage", "UK")),
+    )
+    mindmap = normalise(response).mindmap
+    assert mindmap is not None
+    assert mindmap.branches[0].items == ("Compliance",)

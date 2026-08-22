@@ -12,6 +12,8 @@ description: |
 repositories:
   - name: tme-observability
 
+part_of: tme-platform
+
 documentation_prefixes:
   - raw/confluence/observability
 

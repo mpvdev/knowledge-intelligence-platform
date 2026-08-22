@@ -43,6 +43,7 @@ class StubSlack:
         self.valid = True
         self.seen: set[str] = set()
         self.feedback_store = self
+        self.diagram_store = None
 
     def verify(self, body: bytes, timestamp: str | None, signature: str | None) -> bool:
         return self.valid
@@ -126,6 +127,42 @@ def client(recorder: Recorder, slack: StubSlack) -> Iterator[TestClient]:
     )
     yield TestClient(main.app)
     main.app.state.application = None
+
+
+class StubDiagramStore:
+    def __init__(self) -> None:
+        self.images = {"11111111-2222-3333-4444-555555555555": b"\x89PNG\r\n\x1a\n"}
+
+    def read(self, diagram_id: str) -> bytes | None:
+        return self.images.get(diagram_id)
+
+
+def test_a_diagram_is_served_as_an_image(client: TestClient, slack: StubSlack) -> None:
+    slack.diagram_store = StubDiagramStore()
+    response = client.get("/diagrams/11111111-2222-3333-4444-555555555555.png")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG")
+
+
+def test_a_diagram_answers_head_requests(client: TestClient, slack: StubSlack) -> None:
+    slack.diagram_store = StubDiagramStore()
+    response = client.head("/diagrams/11111111-2222-3333-4444-555555555555.png")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_an_unknown_diagram_is_not_found(client: TestClient, slack: StubSlack) -> None:
+    slack.diagram_store = StubDiagramStore()
+    assert client.get("/diagrams/99999999-2222-3333-4444-555555555555.png").status_code == 404
+
+
+def test_a_diagram_id_that_is_not_a_uuid_is_rejected(client: TestClient, slack: StubSlack) -> None:
+    slack.diagram_store = StubDiagramStore()
+    assert client.get("/diagrams/..%2F..%2Fsecrets.png").status_code == 404
+    assert client.get("/diagrams/raw%2Fconfluence%2Fkey.png").status_code == 404
 
 
 def test_health(client: TestClient) -> None:

@@ -16,6 +16,8 @@ repositories:
     url: https://github.com/sky-uk/tsi-config-eks-stage
     branch: feat/pipeline-deploy
 
+part_of: tme-platform
+
 documentation_prefixes:
   - raw/confluence/eks
 

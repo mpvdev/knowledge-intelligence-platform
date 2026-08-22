@@ -162,6 +162,12 @@ Dockerfile
 
 - Retrieve first and answer only from returned content.
 - Cite all factual answers using returned source identifiers.
+- Component `notes:` carry knowledge agreed outside Confluence. They are an approved source
+  because the registry is authoritative, and each is dated so it can be reviewed and
+  expired. Their provenance is never indexed.
+- The approved-source boundary is the configured S3 prefix: uploading a Confluence PDF
+  there is the act of approval. A PDF no component maps is still indexed, but carries no
+  owner, and ownership for it must never be inferred.
 - Never invent components, repositories, ownership, prerequisites, runbooks, procedures,
   account IDs, IAM roles, or deployment behavior.
 - Do not claim that indexed information represents live infrastructure state.
@@ -173,6 +179,9 @@ Dockerfile
 - When supported information establishes a workflow, process, architecture, lifecycle, or
   mapping, generate a high-level visual automatically for Slack. Do not require the user to
   request it and never invent missing nodes or relationships.
+- When supported information instead breaks a subject into areas with no order between them,
+  generate a radial knowledge map instead of a flow. Never redraw an ordered process as a
+  map, and never invent a branch or an item.
 - Present supported onboarding information as a guided journey.
 - Present supported service differences as a clear comparison.
 - Offer only grounded, component-relevant next questions.
@@ -190,6 +199,7 @@ Keep only these application endpoints:
 - `POST /knowledge/query`
 - `POST /admin/reindex`
 - `POST /slack/events`
+- `GET /diagrams/{id}.png` — serves a rendered diagram to Slack's image fetcher only
 
 Do not reintroduce change-impact, repository-analysis, evaluation, visual-processing,
 GitHub-agent, or multi-agent-orchestrator endpoints in Phase 1.

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
+
+UNMAPPED_COMPONENT_ID = "unmapped"
 
 
 class SourceType(StrEnum):
@@ -66,11 +69,26 @@ class SearchResult(BaseModel):
         return self.chunk.title
 
 
+class MindMapBranch(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str = Field(min_length=1)
+    items: tuple[str, ...] = ()
+
+
+class MindMap(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    center: str = Field(min_length=1)
+    branches: tuple[MindMapBranch, ...] = Field(min_length=2, max_length=6)
+
+
 class KnowledgeAnswer(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     answer: str
     visual: str | None = None
+    mindmap: MindMap | None = None
     suggested_questions: tuple[str, ...] = ()
     response_type: str = "general"
 
@@ -97,6 +115,7 @@ class ReindexSummary(BaseModel):
     chunks: int = Field(ge=0)
     vectors: int = Field(ge=0)
     skipped: int = Field(ge=0)
+    unmapped: int = Field(default=0, ge=0)
 
 
 class HealthResponse(BaseModel):
@@ -109,22 +128,63 @@ class ReadyResponse(BaseModel):
     cached_chunks: int = Field(ge=0)
 
 
+COMPONENT_ID = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
+
+
 class Repository(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: str = Field(pattern=r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
     url: str | None = None
     branch: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+    purpose: str | None = None
+
+
+class Contact(BaseModel):
+    """Where to send someone who needs help with a component."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    slack: str | None = Field(default=None, pattern=r"^[#@][A-Za-z0-9._-]+$")
+    team: str | None = None
+
+    @property
+    def route(self) -> str:
+        return self.slack or self.name
+
+
+class Note(BaseModel):
+    """Knowledge agreed outside Confluence, captured against a component."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    note: str = Field(min_length=1)
+    recorded: date
+    source: str | None = None
+
+
+class RelatedComponent(BaseModel):
+    """A directed, registry-declared link to another component."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(pattern=COMPONENT_ID)
+    relationship: str = Field(min_length=1)
 
 
 class Component(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    id: str = Field(pattern=COMPONENT_ID)
     name: str
     description: str
     aliases: tuple[str, ...] = ()
     repositories: tuple[Repository, ...] = ()
+    contact: Contact | None = None
+    notes: tuple[Note, ...] = ()
+    part_of: str | None = Field(default=None, pattern=COMPONENT_ID)
+    related: tuple[RelatedComponent, ...] = ()
     documentation_prefixes: tuple[str, ...] = ()
     owner: str | None = None
     status: str = "active"

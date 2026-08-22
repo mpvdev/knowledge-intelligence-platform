@@ -217,20 +217,6 @@ variable "cloudwatch_log_kms_key_arn" {
   }
 }
 
-variable "secret_recovery_window_in_days" {
-  description = "Recovery window applied when deleting the application secret."
-  type        = number
-  default     = 7
-
-  validation {
-    condition = contains(
-      concat([0], range(7, 31)),
-      var.secret_recovery_window_in_days
-    )
-    error_message = "secret_recovery_window_in_days must be 0 or between 7 and 30."
-  }
-}
-
 variable "permissions_boundary_arn" {
   description = "Optional permissions boundary applied to ECS IAM roles."
   type        = string
@@ -338,6 +324,12 @@ variable "vector_bucket_name" {
   }
 }
 
+variable "diagram_prefix" {
+  description = "S3 prefix holding rendered Slack flow diagrams."
+  type        = string
+  default     = "diagrams/slack"
+}
+
 variable "vector_index_name" {
   description = "Name of the platform knowledge vector index."
   type        = string
@@ -413,10 +405,10 @@ variable "visual_max_pages_per_document" {
 variable "vector_top_k" {
   description = "Maximum semantic results considered for each query."
   type        = number
-  default     = 5
+  default     = 25
 
   validation {
-    condition     = var.vector_top_k >= 1 && var.vector_top_k <= 30
-    error_message = "vector_top_k must be between 1 and 30."
+    condition     = var.vector_top_k >= 1 && var.vector_top_k <= 100
+    error_message = "vector_top_k must be between 1 and 100."
   }
 }

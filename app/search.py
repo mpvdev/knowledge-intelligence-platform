@@ -8,7 +8,7 @@ from threading import RLock
 from time import monotonic
 
 from app.embeddings import Embeddings, EmbeddingUnavailableError
-from app.models import Chunk, SearchResult
+from app.models import UNMAPPED_COMPONENT_ID, Chunk, SearchResult
 from app.vector_store import VectorStore
 
 LOGGER = logging.getLogger(__name__)
@@ -47,11 +47,16 @@ STOP_WORDS = frozenset(
 
 class HybridSearch:
     def __init__(
-        self, embeddings: Embeddings, vectors: VectorStore, top_k: int
+        self,
+        embeddings: Embeddings,
+        vectors: VectorStore,
+        top_k: int,
+        per_document: int = 3,
     ) -> None:
         self.embeddings = embeddings
         self.vectors = vectors
         self.top_k = top_k
+        self.per_document = max(1, per_document)
         self._chunks_by_id: dict[str, Chunk] = {}
         self._postings: dict[str, tuple[tuple[str, float], ...]] = {}
         self._lock = RLock()
@@ -80,10 +85,11 @@ class HybridSearch:
         if not normalized:
             return ()
         self._restore_keyword_cache_if_empty()
-        effective_limit = min(max(limit, 1), self.top_k)
+        returned = max(limit, 1)
+        candidates = max(returned, self.top_k)
         started = monotonic()
         try:
-            semantic = self._semantic(normalized, effective_limit)
+            semantic = self._semantic(normalized, candidates)
         except (EmbeddingUnavailableError, RuntimeError):
             LOGGER.exception(
                 "Semantic search unavailable; continuing with keyword search.",
@@ -92,8 +98,8 @@ class HybridSearch:
             semantic = ()
         semantic_ms = (monotonic() - started) * 1_000
         keyword_started = monotonic()
-        keyword = self._keyword(normalized, effective_limit)
-        ranked = self._reciprocal_rank_fusion(semantic, keyword, effective_limit)
+        keyword = self._keyword(normalized, candidates)
+        ranked = self._reciprocal_rank_fusion(semantic, keyword, returned, self.per_document)
         LOGGER.info(
             "Knowledge search completed.",
             extra={
@@ -102,6 +108,10 @@ class HybridSearch:
                 "duration_ms": round((monotonic() - started) * 1_000, 2),
                 "semantic_ms": round(semantic_ms, 2),
                 "keyword_ms": round((monotonic() - keyword_started) * 1_000, 2),
+                "candidates": candidates,
+                "semantic_hits": len(semantic),
+                "keyword_hits": len(keyword),
+                "returned": len(ranked),
             },
         )
         return tuple(
@@ -156,7 +166,14 @@ class HybridSearch:
         semantic: tuple[tuple[Chunk, float], ...],
         keyword: tuple[tuple[Chunk, float], ...],
         limit: int,
+        per_document: int = 3,
     ) -> tuple[tuple[Chunk, float], ...]:
+        """Fuse both rankings, then stop any one document filling every slot.
+
+        A long document usually holds the best chunk *and* the next several, which
+        crowds out the document that answers the rest of the question. Chunks
+        beyond the per-document cap are held back and only used to top up.
+        """
         scores: dict[str, float] = {}
         chunks: dict[str, Chunk] = {}
         for ranking in (semantic, keyword):
@@ -165,23 +182,50 @@ class HybridSearch:
                 scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1 / (
                     60 + rank
                 )
-        return tuple(
-            (chunks[chunk_id], scores[chunk_id])
-            for chunk_id in sorted(scores, key=lambda item: (-scores[item], item))[
-                :limit
-            ]
-        )
+        ordered = sorted(scores, key=lambda item: (-scores[item], item))
+        selected: list[str] = []
+        overflow: list[str] = []
+        taken: Counter[str] = Counter()
+        for chunk_id in ordered:
+            document = chunks[chunk_id].document_id
+            if taken[document] >= per_document:
+                overflow.append(chunk_id)
+                continue
+            taken[document] += 1
+            selected.append(chunk_id)
+            if len(selected) == limit:
+                break
+        for chunk_id in overflow:
+            if len(selected) >= limit:
+                break
+            selected.append(chunk_id)
+        return tuple((chunks[chunk_id], scores[chunk_id]) for chunk_id in selected[:limit])
+
+
+def _singular(term: str) -> str:
+    """Fold a simple plural so `osbuild` and `osbuilds` share a posting list."""
+    if len(term) > 4 and term.endswith("s") and not term.endswith(("ss", "us", "is")):
+        return term[:-1]
+    return term
 
 
 def _tokens(text: str) -> tuple[str, ...]:
     return tuple(
-        term
+        _singular(term)
         for term in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]*", text.casefold())
         if term not in STOP_WORDS and len(term) > 1
     )
 
 
 def _searchable(chunk: Chunk) -> str:
+    """Indexed text. The unmapped placeholder is an owner, not a keyword."""
     return "\n".join(
-        (chunk.title, chunk.component_id, " ".join(chunk.heading_path), chunk.text)
+        value
+        for value in (
+            chunk.title,
+            "" if chunk.component_id == UNMAPPED_COMPONENT_ID else chunk.component_id,
+            " ".join(chunk.heading_path),
+            chunk.text,
+        )
+        if value
     )

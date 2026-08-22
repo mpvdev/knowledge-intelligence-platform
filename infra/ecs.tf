@@ -15,27 +15,27 @@ locals {
   )
   openai_api_key_secret_arn = format(
     "%s:OPENAI_API_KEY::",
-    aws_secretsmanager_secret.application.arn
+    data.aws_secretsmanager_secret.application.arn
   )
 
   slack_bot_token_secret_arn = format(
     "%s:SLACK_BOT_TOKEN::",
-    aws_secretsmanager_secret.application.arn
+    data.aws_secretsmanager_secret.application.arn
   )
 
   slack_signing_secret_arn = format(
     "%s:SLACK_SIGNING_SECRET::",
-    aws_secretsmanager_secret.application.arn
+    data.aws_secretsmanager_secret.application.arn
   )
 
   github_token_secret_arn = format(
     "%s:GITHUB_TOKEN::",
-    aws_secretsmanager_secret.application.arn
+    data.aws_secretsmanager_secret.application.arn
   )
 
   admin_token_secret_arn = format(
     "%s:ADMIN_TOKEN::",
-    aws_secretsmanager_secret.application.arn
+    data.aws_secretsmanager_secret.application.arn
   )
 }
 
@@ -145,6 +145,14 @@ resource "aws_ecs_task_definition" "application" {
         {
           name  = "KNOWLEDGE_INTELLIGENCE_SLACK_CONVERSATION_WINDOW"
           value = tostring(var.slack_conversation_window)
+        },
+        {
+          name  = "KNOWLEDGE_INTELLIGENCE_DIAGRAM_PREFIX"
+          value = var.diagram_prefix
+        },
+        {
+          name  = "KNOWLEDGE_INTELLIGENCE_PUBLIC_BASE_URL"
+          value = aws_apigatewayv2_api.application.api_endpoint
         },
         {
           name  = "KNOWLEDGE_INTELLIGENCE_FEEDBACK_PREFIX"

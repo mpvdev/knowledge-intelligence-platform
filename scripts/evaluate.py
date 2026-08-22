@@ -116,6 +116,8 @@ class NoInternalLeakage(Evaluator[str, str]):
         "[s3]",
         "retrieval",
         "the passages",
+        "the registry lists",
+        "the registry shows",
         "the documentation says",
         "based on the information provided",
         "indexed",
@@ -161,8 +163,35 @@ def load_cases(directory: Path) -> list[Case[str, str]]:
     return cases
 
 
+def collect_rows(report: Any) -> list[dict[str, Any]]:
+    """Flatten the report into one row per case-evaluation.
+
+    `to_dict()` returns the case detail and the outcomes in separate parallel
+    lists: `cases` carries name, evaluator and metadata, while `scores`,
+    `test_passes` and `reasons` are index-aligned alongside it.
+    """
+    document = report.to_dict()
+    cases = list(document.get("cases", []))
+    scores = list(document.get("scores", []))
+    passes = list(document.get("test_passes", []))
+    reasons = list(document.get("reasons", []))
+    rows: list[dict[str, Any]] = []
+    for index, case in enumerate(cases):
+        rows.append(
+            {
+                "name": case.get("name"),
+                "evaluator": case.get("evaluator", "unknown"),
+                "metadata": case.get("metadata") or {},
+                "score": float(scores[index]) if index < len(scores) else 0.0,
+                "test_pass": bool(passes[index]) if index < len(passes) else False,
+                "reason": str(reasons[index]) if index < len(reasons) else "",
+            }
+        )
+    return rows
+
+
 def render_report(report: Any, *, judged: bool) -> str:
-    rows = list(report.to_dict().get("cases", []))
+    rows = collect_rows(report)
     by_evaluator: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -249,7 +278,11 @@ def main() -> None:
 
     @eval_task(TracedHandler())
     def run_case(case: Case[str, str]) -> str:
-        result = application.agent.answer(str(case.input))
+        try:
+            result = application.agent.answer(str(case.input))
+        except Exception as exc:
+            print(f"  case {case.name} raised {type(exc).__name__}: {exc}", flush=True)
+            raise
         return public_answer(result.answer)
 
     evaluators: list[Evaluator[str, str]] = [

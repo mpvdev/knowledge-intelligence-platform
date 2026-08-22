@@ -10,6 +10,9 @@ description = "Source-grounded Platform Knowledge Agent for TME"
 readme = "README.md"
 requires-python = ">=3.14"
 
+[tool.setuptools]
+packages = ["app"]
+
 [project.optional-dependencies]
 dev = [
     "boto3-stubs[s3]>=1.42,<2.0",
@@ -38,6 +41,10 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 python_version = "3.14"
 strict = true
 files = ["app", "scripts"]
+
+[[tool.mypy.overrides]]
+module = "graphviz.*"
+ignore_missing_imports = true
 
 # strands_evals ships no py.typed marker, so its symbols are Any to mypy.
 # Scope the relaxation to the evaluation script only; app/ stays fully strict.

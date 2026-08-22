@@ -8,10 +8,20 @@ aliases:
   - OS Builds
   - Golden AMI
   - OS Image Management
-  - Patch
 
 repositories:
   - name: tme-ami-builder
+
+notes:
+  - note: >-
+      OS Builds covers RHEL and Windows golden images. Windows support was added about a
+      year into development and has no separate documentation, so Windows images follow
+      the same documented golden-image build process as RHEL. The Windows base AMI choice
+      is still open, so treat base-image specifics as RHEL-only.
+    recorded: 2026-08-22
+    source: TME platform discussion
+
+part_of: tme-platform
 
 documentation_prefixes:
   - raw/confluence/osbuilds

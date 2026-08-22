@@ -13,6 +13,8 @@ repositories:
   - name: tme-patch-management
     local_path: Central Patch/patch-management
 
+part_of: tme-platform
+
 documentation_prefixes:
   - raw/confluence/patch
 

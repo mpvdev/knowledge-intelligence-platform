@@ -10,7 +10,7 @@ output "ecr_repository_url" {
 
 output "application_secret_arn" {
   description = "ARN of the application Secrets Manager secret."
-  value       = aws_secretsmanager_secret.application.arn
+  value       = data.aws_secretsmanager_secret.application.arn
 }
 
 output "ecs_execution_role_arn" {

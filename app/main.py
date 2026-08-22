@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -35,28 +36,31 @@ from app.models import (
 from app.registry import ComponentRegistry
 from app.s3_reader import S3Reader
 from app.search import HybridSearch
-from app.slack import FeedbackStore, SlackIntegration
+from app.slack import DiagramStore, FeedbackStore, SlackIntegration
 from app.vector_store import VectorStore
+from app.waiting import waiting_message
 
 LOGGER = logging.getLogger(__name__)
 
 
+STANDARD_RECORD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {
+    "message",
+    "asctime",
+    "taskName",
+}
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
+        payload: dict[str, object] = {
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for name in (
-            "correlation_id",
-            "operation",
-            "component",
-            "duration_ms",
-            "semantic_ms",
-            "keyword_ms",
-        ):
-            if value := getattr(record, name, None):
+        for name, value in record.__dict__.items():
+            if name in STANDARD_RECORD_FIELDS or name.startswith("_"):
+                continue
+            if isinstance(value, str | int | float | bool) or value is None:
                 payload[name] = value
         return json.dumps(payload, separators=(",", ":"))
 
@@ -137,6 +141,7 @@ def build_application(settings: Settings) -> Application:
         search=search,
         s3_prefix=settings.s3_prefix,
         batch_size=settings.embedding_batch_size,
+        ingest_unmapped_documents=settings.ingest_unmapped_documents,
         diagram_analyzer=(
             DiagramAnalyzer(
                 api_key=settings.openai_api_key.get_secret_value(),
@@ -159,6 +164,12 @@ def build_application(settings: Settings) -> Application:
                 region=settings.aws_region,
                 bucket=settings.s3_bucket,
                 prefix=settings.feedback_prefix,
+            ),
+            diagram_store=DiagramStore(
+                region=settings.aws_region,
+                bucket=settings.s3_bucket,
+                prefix=settings.diagram_prefix,
+                base_url=settings.public_base_url,
             ),
         )
         if settings.slack_enabled
@@ -236,6 +247,26 @@ def ready(request: Request) -> ReadyResponse:
     )
 
 
+DIAGRAM_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+@app.api_route("/diagrams/{diagram_id}.png", methods=["GET", "HEAD"])
+def diagram(diagram_id: str, request: Request) -> Response:
+    current = application(request)
+    if current.slack is None or current.slack.diagram_store is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    if not DIAGRAM_ID.fullmatch(diagram_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    image = current.slack.diagram_store.read(diagram_id)
+    if image is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return Response(
+        content=image,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    )
+
+
 @app.post("/knowledge/query", response_model=KnowledgeQueryResponse)
 def query(payload: QueryRequest, request: Request) -> KnowledgeQueryResponse:
     result = application(request).agent.answer(
@@ -310,7 +341,7 @@ def _handle_slash_command(
         f"slash:{channel_id}:{user_id}",
     )
     return JSONResponse(
-        {"response_type": "in_channel", "text": "Got it 👋 I'm looking into that now."}
+        {"response_type": "in_channel", "text": waiting_message(question)}
     )
 
 

@@ -21,7 +21,7 @@ while IFS= read -r address; do
   [[ -z "${address}" ]] && continue
 
   case "${address}" in
-    data.*|*.data.*|aws_s3_*|*.aws_s3_*|aws_secretsmanager_*|*.aws_secretsmanager_*|aws_ecr_*|*.aws_ecr_*)
+    data.*|*.data.*|aws_s3_*|*.aws_s3_*|aws_s3vectors_*|*.aws_s3vectors_*|aws_secretsmanager_*|*.aws_secretsmanager_*|aws_ecr_*|*.aws_ecr_*)
       preserved_resources+=("${address}")
       ;;
     *)
@@ -35,9 +35,9 @@ if ((${#destroy_targets[@]} == 0)); then
   exit 0
 fi
 
-echo "Terraform-managed S3, Secrets Manager, and ECR resources intentionally preserved:"
+echo "Terraform-managed S3, S3 Vectors, Secrets Manager, and ECR resources intentionally preserved:"
 if ((${#preserved_resources[@]} == 0)); then
-  echo "  - No managed S3, Secrets Manager, or ECR resources are present in state."
+  echo "  - No managed S3, S3 Vectors, Secrets Manager, or ECR resources are present in state."
 else
   printf '  - %s\n' "${preserved_resources[@]}"
 fi

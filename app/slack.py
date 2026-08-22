@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from threading import Lock
 from uuid import UUID, uuid4
 
@@ -19,8 +20,9 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
 
 from app.agent import PlatformKnowledgeAgent, public_answer
-from app.diagram import render_flow
-from app.models import KnowledgeAnswer
+from app.diagram import render_flow, render_mindmap
+from app.models import KnowledgeAnswer, MindMap
+from app.waiting import waiting_message
 
 LOGGER = logging.getLogger(__name__)
 MENTION = re.compile(r"<@[A-Z0-9]+>")
@@ -36,6 +38,66 @@ class SlackAction:
     answer_id: str | None = None
     response_type: str | None = None
     rating: str | None = None
+
+
+@dataclass(frozen=True)
+class Rendered:
+    """Everything the delivery channel needs for one answered question."""
+
+    answer: str
+    blocks: tuple[dict[str, object], ...] = ()
+    visual: str | None = None
+    diagram_title: str = "TME high-level view"
+
+
+class DiagramStore:
+    """Stores a rendered diagram and serves it back for the image block.
+
+    Slack fetches an image_url with HEAD before GET. A presigned S3 URL is
+    signed for GET alone and answers HEAD with 403, so the diagram is served
+    through the application instead.
+    """
+
+    def __init__(self, *, region: str, bucket: str, prefix: str, base_url: str = "") -> None:
+        self.client = boto3.client("s3", region_name=region)
+        self.bucket = bucket
+        self.prefix = prefix.strip("/")
+        self.base_url = base_url.rstrip("/")
+
+    def publish(self, image: BytesIO) -> str | None:
+        if not self.base_url:
+            return None
+        diagram_id = str(uuid4())
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=self._key(diagram_id),
+                Body=image.getvalue(),
+                ContentType="image/png",
+            )
+        except (BotoCoreError, ClientError):
+            LOGGER.warning(
+                "Slack diagram could not be published.",
+                extra={"operation": "publish_diagram", "component": "slack"},
+            )
+            return None
+        return f"{self.base_url}/diagrams/{diagram_id}.png"
+
+    def read(self, diagram_id: str) -> bytes | None:
+        try:
+            response = self.client.get_object(
+                Bucket=self.bucket, Key=self._key(diagram_id)
+            )
+            body = response["Body"]
+            try:
+                return bytes(body.read())
+            finally:
+                body.close()
+        except (BotoCoreError, ClientError):
+            return None
+
+    def _key(self, diagram_id: str) -> str:
+        return f"{self.prefix}/{diagram_id}.png"
 
 
 class FeedbackStore:
@@ -87,6 +149,7 @@ class SlackIntegration:
         maximum_message_length: int,
         feedback_store: FeedbackStore,
         streaming_enabled: bool = True,
+        diagram_store: DiagramStore | None = None,
     ) -> None:
         self.client = WebClient(token=bot_token)
         self.verifier = SignatureVerifier(signing_secret=signing_secret)
@@ -94,6 +157,7 @@ class SlackIntegration:
         self.maximum_message_length = maximum_message_length
         self.streaming_enabled = streaming_enabled
         self.feedback_store = feedback_store
+        self.diagram_store = diagram_store
         self._events: dict[str, datetime] = {}
         self._lock = Lock()
 
@@ -133,28 +197,21 @@ class SlackIntegration:
                 (),
             )
             return
-        progress_ts = self._post(
-            channel,
-            thread_ts,
-            "Got it 👋 I’m looking into that now…",
-            (),
-        )
+        progress_ts = self._post(channel, thread_ts, waiting_message(question), ())
         partial_update = (
             self._partial_updater(channel, progress_ts)
             if progress_ts and self.streaming_enabled
             else None
         )
-        answer, blocks, visual = self._answer(
+        rendered = self._answer(
             question,
             conversation_id=f"{channel}:{thread_ts}",
             on_partial=partial_update,
         )
         if progress_ts:
-            self._update(channel, progress_ts, answer, blocks)
+            self._update(channel, progress_ts, rendered.answer, rendered.blocks)
         else:
-            self._post(channel, thread_ts, answer, blocks)
-        if visual:
-            self._upload_diagram(channel, thread_ts, visual)
+            self._post(channel, thread_ts, rendered.answer, rendered.blocks)
 
     def process_slash(
         self,
@@ -162,14 +219,14 @@ class SlackIntegration:
         response_url: str,
         conversation_id: str,
     ) -> None:
-        answer, blocks, _ = self._answer(question, conversation_id=conversation_id)
+        rendered = self._answer(question, conversation_id=conversation_id)
         payload: dict[str, object] = {
             "response_type": "in_channel",
             "replace_original": False,
-            "text": answer,
+            "text": rendered.answer,
         }
-        if blocks:
-            payload["blocks"] = list(blocks)
+        if rendered.blocks:
+            payload["blocks"] = list(rendered.blocks)
         try:
             response = httpx.post(
                 response_url,
@@ -197,7 +254,7 @@ class SlackIntegration:
         *,
         conversation_id: str,
         on_partial: Callable[[str], None] | None = None,
-    ) -> tuple[str, tuple[dict[str, object], ...], str | None]:
+    ) -> Rendered:
         try:
             if on_partial is not None:
                 result = self.agent.answer_stream(
@@ -208,36 +265,59 @@ class SlackIntegration:
             else:
                 result = self.agent.answer(question, conversation_id=conversation_id)
             answer = public_answer(result.answer)
-            blocks = self._blocks(result, answer)
-            visual = result.visual
+            title = _diagram_title(result.response_type)
+            if result.mindmap is not None:
+                title = "Knowledge map"
+                diagram = self._mindmap_url(result.mindmap, title)
+            elif result.visual:
+                diagram = self._diagram_url(result.visual, title)
+            else:
+                diagram = None
+            return Rendered(
+                answer=answer,
+                blocks=self._blocks(result, answer, diagram, title),
+                visual=result.visual,
+                diagram_title=title,
+            )
         except Exception:
             LOGGER.exception(
                 "Slack knowledge request failed.",
                 extra={"operation": "answer", "component": "slack"},
             )
-            answer = "I could not process that request. Please try again."
-            blocks = ()
-            visual = None
-        return answer, blocks, visual
+            return Rendered(answer="I could not process that request. Please try again.")
 
-    def _upload_diagram(self, channel: str, thread_ts: str, visual: str) -> None:
+    def _mindmap_url(self, mindmap: MindMap, title: str) -> str | None:
+        if self.diagram_store is None:
+            return None
         try:
-            self.client.files_upload_v2(
-                channel=channel,
-                thread_ts=thread_ts,
-                file=render_flow(visual),
-                filename="tme-high-level-view.png",
-                title="TME high-level view",
+            image = render_mindmap(
+                mindmap.center,
+                [(branch.label, branch.items) for branch in mindmap.branches],
+                title=title,
             )
-        except SlackApiError as exc:
-            LOGGER.exception(
-                "Slack diagram upload failed.",
-                extra={
-                    "operation": "upload_diagram",
-                    "component": "slack",
-                    "slack_error": _slack_error_code(exc),
-                },
+        except OSError:
+            image = None
+        if image is None:
+            LOGGER.warning(
+                "Knowledge map could not be rendered.",
+                extra={"operation": "render_mindmap", "component": "slack"},
             )
+            return None
+        return self.diagram_store.publish(image)
+
+    def _diagram_url(self, visual: str, title: str) -> str | None:
+        """Render the flow and publish it at a URL Slack can fetch."""
+        if self.diagram_store is None:
+            return None
+        try:
+            image = render_flow(_flow_nodes(visual), title=title)
+        except OSError:
+            LOGGER.warning(
+                "Slack diagram could not be rendered.",
+                extra={"operation": "render_diagram", "component": "slack"},
+            )
+            return None
+        return self.diagram_store.publish(image)
 
     def parse_action(self, payload: dict[str, object]) -> SlackAction | None:
         actions = payload.get("actions")
@@ -277,10 +357,12 @@ class SlackIntegration:
                 )
         return None
 
+    @staticmethod
     def _blocks(
-        self,
         result: KnowledgeAnswer,
         answer: str,
+        diagram_url: str | None = None,
+        diagram_title: str = "TME high-level view",
     ) -> tuple[dict[str, object], ...]:
         answer_id = str(uuid4())
         display_answer = (
@@ -305,13 +387,17 @@ class SlackIntegration:
                 "text": {"type": "mrkdwn", "text": display_answer},
             }
         )
-        if result.visual:
-            visual_title = (
-                "Journey overview"
-                if result.response_type == "onboarding"
-                else "High-level view"
-            )
-            blocks.extend(_visual_blocks(visual_title, result.visual))
+        if result.visual or result.mindmap is not None:
+            if diagram_url:
+                blocks.append(
+                    {
+                        "type": "image",
+                        "image_url": diagram_url,
+                        "alt_text": diagram_title,
+                    }
+                )
+            elif result.visual:
+                blocks.extend(_visual_blocks(diagram_title, result.visual))
         suggestions = tuple(
             public_answer(question)
             for question in result.suggested_questions
@@ -413,10 +499,15 @@ class SlackIntegration:
             )
             timestamp = response.get("ts")
             return timestamp if isinstance(timestamp, str) else None
-        except SlackApiError:
-            LOGGER.exception(
+        except SlackApiError as exc:
+            LOGGER.warning(
                 "Slack response delivery failed.",
-                extra={"operation": "post_message", "component": "slack"},
+                extra={
+                    "operation": "post_message",
+                    "component": "slack",
+                    "slack_error": _slack_error_code(exc),
+                    "slack_error_detail": _slack_error_detail(exc),
+                },
             )
             return None
 
@@ -427,20 +518,43 @@ class SlackIntegration:
         answer: str,
         blocks: tuple[dict[str, object], ...],
     ) -> None:
-        try:
-            self.client.chat_update(
-                channel=channel,
-                ts=timestamp,
-                text=answer,
-                blocks=list(blocks) or None,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
-        except SlackApiError:
-            LOGGER.exception(
-                "Slack progress message update failed.",
-                extra={"operation": "update_message", "component": "slack"},
-            )
+        for attempt in _delivery_attempts(blocks):
+            try:
+                self.client.chat_update(
+                    channel=channel,
+                    ts=timestamp,
+                    text=answer,
+                    blocks=list(attempt) or None,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+                return
+            except SlackApiError as exc:
+                LOGGER.warning(
+                    "Slack progress message update failed.",
+                    extra={
+                        "operation": "update_message",
+                        "component": "slack",
+                        "slack_error": _slack_error_code(exc),
+                        "slack_error_detail": _slack_error_detail(exc),
+                        "blocks": len(attempt),
+                    },
+                )
+
+
+def _delivery_attempts(
+    blocks: tuple[dict[str, object], ...],
+) -> tuple[tuple[dict[str, object], ...], ...]:
+    """Progressively simpler renderings, so a rejected block never costs the answer."""
+    attempts: list[tuple[dict[str, object], ...]] = [blocks]
+    without_images = tuple(
+        block for block in blocks if block.get("type") != "image"
+    )
+    if without_images != blocks:
+        attempts.append(without_images)
+    if blocks:
+        attempts.append(())
+    return tuple(attempts)
 
 
 def _nested_string(payload: dict[str, object], parent: str, child: str) -> str | None:
@@ -457,13 +571,35 @@ def _slack_error_code(error: SlackApiError) -> str:
     return value if isinstance(value, str) else "unknown"
 
 
-def _visual_blocks(title: str, visual: str) -> tuple[dict[str, object], ...]:
-    """Render model-derived relationships as colorful Slack flow cards."""
-    nodes = tuple(
+def _slack_error_detail(error: SlackApiError) -> str:
+    metadata = error.response.get("response_metadata")
+    if isinstance(metadata, dict):
+        messages = metadata.get("messages")
+        if isinstance(messages, list) and messages:
+            return " | ".join(str(message) for message in messages[:3])[:500]
+    return ""
+
+
+def _flow_nodes(visual: str) -> tuple[str, ...]:
+    """Split a stored flow back into its grounded nodes."""
+    return tuple(
         node.strip()
         for node in re.split(r"\s*↓\s*", public_answer(visual))
         if node.strip()
     )[:8]
+
+
+def _diagram_title(response_type: str) -> str:
+    return {
+        "onboarding": "Your onboarding journey",
+        "comparison": "Service comparison",
+        "mapping": "Connected knowledge map",
+    }.get(response_type, "TME high-level view")
+
+
+def _visual_blocks(title: str, visual: str) -> tuple[dict[str, object], ...]:
+    """Render model-derived relationships as colorful Slack flow cards."""
+    nodes = _flow_nodes(visual)
     if not nodes:
         return ()
     blocks: list[dict[str, object]] = [

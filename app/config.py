@@ -35,8 +35,10 @@ class Settings(BaseSettings):
 
     vector_bucket_name: str
     vector_index_name: str = "platform-knowledge"
-    vector_top_k: int = Field(default=5, ge=1, le=30)
+    vector_top_k: int = Field(default=25, ge=1, le=100)
     agent_max_search_results: int = Field(default=5, ge=1, le=10)
+
+    ingest_unmapped_documents: bool = True
 
     registry_directory: Path = Path("registry/components")
     github_enabled: bool = False
@@ -49,6 +51,8 @@ class Settings(BaseSettings):
     slack_max_message_length: int = Field(default=3_500, ge=500, le=4_000)
     slack_conversation_window: int = Field(default=20, ge=6, le=100)
     feedback_prefix: str = "feedback/slack"
+    diagram_prefix: str = "diagrams/slack"
+    public_base_url: str = ""
     admin_token: SecretStr = SecretStr("")
 
     # Progressive Slack delivery: the answer fills in while it is generated.
